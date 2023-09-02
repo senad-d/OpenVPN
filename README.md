@@ -1,4 +1,4 @@
-# AWS and Azure VPN
+![VPN_for_AWS_and_Azure](https://github.com/senad-d/OpenVPN/assets/112484166/caeced55-8890-4ddd-ad05-27d92140d855)
 
 ### This is a solution for creating VPN server for AWS and Azure (fast and easy).
 
@@ -27,7 +27,7 @@ A CloudFormation template for adding an EC2 instance with a fully automated boot
   - EIP 
 - VPN bootstrap script for installing and running OpenVPN 
 
-![SCR-20230704-jajh](https://github.com/valconsee/VPN/assets/114985182/5242034b-94bf-4f55-87be-ae89b665af3a)
+<img width="871" alt="vpn_aws_infra" src="https://github.com/senad-d/OpenVPN/assets/112484166/e7d74736-b8c4-4887-b032-ee748af9e3e1">
 
 ---
 
@@ -96,7 +96,11 @@ By following these steps, you can efficiently generate OpenVPN users and automat
 
 <details><summary> Video </summary>
 
-https://user-images.githubusercontent.com/114985182/205624165-ba77b327-11bd-40ed-a912-92f6dcecf084.mp4
+
+
+https://github.com/senad-d/OpenVPN/assets/112484166/708e9f09-a506-433b-89bf-7fadfbe0c4e5
+
+
 
 </details>
 
@@ -186,7 +190,11 @@ ll /root/pki/issued/
 
 <details><summary> Video </summary>
 
-https://user-images.githubusercontent.com/114985182/205856683-904c2135-0f39-41a8-9bc5-2a493897ed84.mp4
+
+
+https://github.com/senad-d/OpenVPN/assets/112484166/b0b29814-8a31-4878-8c32-542b1a9edd87
+
+
 
 </details>
 
