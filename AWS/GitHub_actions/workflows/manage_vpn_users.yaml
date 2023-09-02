@@ -1,0 +1,58 @@
+name: 4 - Manage users VPN - automation
+
+env:
+  AWS_REGION: 'eu-west-1'
+  PROJECT: 'vnp'
+  ENV: 'dev'
+
+on:
+  push:
+    branches: ['*']
+    paths: ['user/user-list']
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+     
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_DEV }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_DEV }}
+        aws-region: ${{ env.AWS_REGION }}
+    - name: Manage users
+      run: |
+        ID="Key=InstanceIds,Values=$(aws ssm get-parameter --name ${{ env.PROJECT }}-${{ env.ENV }}-vpn-ec2-id --query "Parameter.Value" --output text --region ${{ env.AWS_REGION }})"
+        S3="$(aws ssm get-parameter --name ${{ env.PROJECT }}-${{ env.ENV }}-vpn-users --query "Parameter.Value" --output text --region ${{ env.AWS_REGION }})"
+
+        # Push new list to S3
+        aws s3 sync ./user/ s3://$S3/
+
+        # Update old user lists
+        aws ssm send-command \
+        --comment "Update old user lists" \
+        --targets $ID \
+        --document-name "AWS-RunShellScript" \
+        --parameters 'commands=["mv /root/user/list_of_new_users.txt /root/user/list_of_vpn_users.txt"]' \
+        --output table
+
+        # Get new user list from S3
+        aws ssm send-command \
+        --comment "Get new user list" \
+        --targets $ID \
+        --document-name "AWS-RunShellScript" \
+        --parameters 'commands=["aws s3api get-object --bucket '"$S3"' --key user-list /root/user/list_of_new_users.txt"]' \
+        --output table
+
+        # Update new users
+        aws ssm send-command \
+        --comment "Update users" \
+        --targets $ID \
+        --document-name "AWS-RunShellScript" \
+        --parameters '{"commands":["sleep 5s && cd /root/ && sudo bash /root/script/create_vpn_user_list > /root/log/user.log"]}' \
+        --output table

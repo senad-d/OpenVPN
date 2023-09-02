@@ -1,0 +1,39 @@
+name: 2 - Remove users from VPN
+
+on:
+  workflow_dispatch:
+    inputs:
+      users:
+        description: 'Remove users from VPN (user1, user2,...)'
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Remove users from the list
+        run: |
+          touch ./user/delete-users
+          echo "${{ github.event.inputs.users }}" | sed 's/, */\n/g' > ./user/delete-users
+          ./scripts/user_delete.sh ./user/delete-users ./user/user-list
+          rm ./user/delete-users
+
+      - name: Commit changes
+        run: |
+          git config --local user.email "senad.dizdarevic@example.com"
+          git config --local user.name "senad-d"
+          git commit -a -m "Add changes"
+     
+      - name: Push changes
+        uses: ad-m/github-push-action@master
+        with:
+          github_token: ${{ secrets.GIT_TOKEN }}
+          branch: ${{ github.ref }}
+      

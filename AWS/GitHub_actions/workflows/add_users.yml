@@ -1,0 +1,39 @@
+name: 1 - Add users to VPN
+
+on:
+  workflow_dispatch:
+    inputs:
+      users:
+        description: 'Add users to VPN (user1, user2,...)'
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Prepare user list
+        run: |
+          touch ./user/add-users
+          echo "${{ github.event.inputs.users }}" | sed 's/, */\n/g' > ./user/add-users
+          ./scripts/user_add.sh ./user/add-users ./user/user-list
+          rm ./user/add-users
+
+      - name: Commit changes
+        run: |
+          git config --local user.email "senad.dizdarevic@example.com"
+          git config --local user.name "senad-d"
+          git commit -a -m "Add changes"
+     
+      - name: Push changes
+        uses: ad-m/github-push-action@master
+        with:
+          github_token: ${{ secrets.GIT_TOKEN }}
+          branch: ${{ github.ref }}
+      

@@ -1,0 +1,405 @@
+---
+AWSTemplateFormatVersion : '2010-09-09'
+Description : Add OpenVPN EC2 instance to the VPC
+Parameters:
+  ProjectName:
+    Description: This will be used for for resource names, keyname and tagging. Resource name can include letters (A-Z and a-z), and dashes (-).
+    Type: String
+    MinLength: '3'
+    Default: vpn-test
+  AdminFullName:
+    Description: Enter Administrator first and last name with "-" in the middle, no spaces.
+    Type: String
+    Default: firstname-lastname
+  Email:
+    Description: Enter email address for Amazon Simple Email Service
+    Type: String
+    Default: senad.dizdarevic.ri@gmail.com
+  Organization:
+    Description: Enter Organization unit name
+    Type: String
+    Default: DevOps-team
+  Company:
+    Description: Enter Company name
+    Type: String
+    Default: Valcon
+  VpcID:
+    Description: Which VPC would you like to use for Ec2 instance?
+    Type: AWS::EC2::VPC::Id
+    ConstraintDescription : VPC must exist
+  VpcCIDR:
+    Description: What is the VPC CIDR?
+    Type: String
+    Default: 172.31.0.0
+  PublicSubnet:
+    Description: Which Public Subnet would you like to use for the Ec2 instance?
+    Type: AWS::EC2::Subnet::Id
+    ConstraintDescription : Subnet must exist
+    Default: subnet-103c7859
+  InstanceType:
+    Type: String
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Default: t3.micro
+    Description : Select Instance Type.
+  AmiId:
+    Description: Region specific AMI from the Parameter Store
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+    ConstraintDescription: Please enter Ubuntu AMI link
+  OpenVPNKeyPair:
+    Description: Which SSH Key would you like to use for remote access to Ec2 instance?
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription : Key Pair must exist
+  SSHSourceCidr:
+    Description: Enter IPv4 address allowed to access your OpenVPN Host via SSH?
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: "^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(/([0-9]|[1-2][0-9]|3[0-2]))?$"
+    ConstraintDescription: The value must be valid IPv4 CIDR block.
+# Provide additional information about the template.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Connect to AWS resources with OpenVPN'
+        Parameters:
+          - ProjectName
+          - AdminFullName
+          - Email
+          - Organization
+          - Company
+          - VpcID
+          - VpcCIDR
+          - PublicSubnet
+          - InstanceType
+          - AmiId
+          - OpenVPNKeyPair
+          - SSHSourceCidr
+    ParameterLabels:
+      ProjectName:
+        default: 'Resources names'
+      AdminFullName:
+        default: 'Admin name'
+      Email:
+        default: 'Admin email'
+      Organization:
+        default: 'Organization unit name'
+      Company:
+        default: 'Company name'
+      VpcID:
+        default: 'Select VPC'
+      VpcCIDR:
+        default: 'VPC CIDR'
+      PublicSubnet:
+        default: 'Select Subnet'
+      InstanceType:
+        default: 'Select instance type'
+      AmiId:
+        default: 'Select instance AMI'
+      OpenVPNKeyPair:
+        default: 'Allowed SSH KEY'
+      SSHSourceCidr:
+        default: 'Allowed IP addresses'
+# Specify the stack resources and their properties.
+Resources:
+  # Create ENI
+  VPNENI:
+      Type: AWS::EC2::NetworkInterface
+      Properties:
+         Description: OpenVPN ENI for FlowLogs
+         SubnetId: !Ref PublicSubnet
+         GroupSet:
+         - !Ref OpenVPNSecurityGroup
+         Tags:
+         - Key: Name
+           Value: !Sub '${ProjectName}.VPN-ENI'
+         - Key: Project
+           Value: !Sub '${ProjectName}'
+  # Create EIP for OpenVPN
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref OpenVPN
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}.VPN-EIP'
+        - Key: Project
+          Value: !Sub '${ProjectName}'
+  # S3 bucket for the list of users
+  UsersBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}.users-bucket'
+      LifecycleConfiguration: 
+        Rules: 
+        - Id: 120 day delete artifacts rule
+          Prefix: !Sub '${ProjectName}.users'
+          Status: Enabled
+          ExpirationInDays: 120
+      AccessControl: Private
+      VersioningConfiguration: 
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: !Sub '${ProjectName}'
+  # UsersBucket bucket policy
+  UsersBucketPolicy: 
+    Type: AWS::S3::BucketPolicy 
+    DependsOn: OpenVPN
+    Properties:
+      Bucket: !Ref UsersBucket
+      PolicyDocument: 
+        Version: '2008-10-17'
+        Statement:
+          -
+            Action:
+              - 's3:ListBucket'
+              - 's3:GetObject'
+              - 's3:PutObject'
+            Effect: Allow
+            Resource:
+              - !Sub 'arn:aws:s3:::${UsersBucket}'
+              - !Sub 'arn:aws:s3:::${UsersBucket}/*'
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+                - !GetAtt OpenVPNRole.Arn
+# Create EC2 Instance for the OpenVPN.
+  OpenVPN:
+    Type: AWS::EC2::Instance
+    Properties:
+      KeyName: !Ref OpenVPNKeyPair
+      BlockDeviceMappings:
+      - DeviceName: /dev/sda1
+        Ebs:
+          VolumeType: gp2
+          VolumeSize: 16
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      InstanceInitiatedShutdownBehavior: stop
+      DisableApiTermination: false
+      IamInstanceProfile: !Ref OpenVPNIamProfile
+      NetworkInterfaces:
+      - NetworkInterfaceId: !Ref VPNENI
+        DeviceIndex: '0'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+
+          cat <<EOF >/root/start_OpenVPN.sh
+          #!/bin/bash -xe
+          
+          ADMINUSER="${AdminFullName}"
+          EMAIL="${Email}"
+          ORG="${Organization}"
+          COMPANY="${Company}"
+          CITY="${AWS::Region}"
+          PROJECT="${ProjectName}"
+          VPC="${VpcCIDR}"
+          EOF
+          echo "TkVUQURBUFQ9IiQoaXAgcm91dGUgfCBncmVwIGRlZmF1bHQgfCBzZWQgLWUgInMvXi4qZGV2Li8vIiAtZSAicy8ucHJvdG8uKi8vIikiCmV4cG9ydCBERUJJQU5fRlJPTlRFTkQ9bm9uaW50ZXJhY3RpdmUKbWtkaXIgLXAgL2V0Yy9hcHQva2V5cmluZ3MgJiYgY3VybCAtZnNTTCBodHRwczovL3N3dXBkYXRlLm9wZW52cG4ubmV0L3JlcG9zL3JlcG8tcHVibGljLmdwZyB8IGdwZyAtLWRlYXJtb3IgPiAvZXRjL2FwdC9rZXlyaW5ncy9vcGVudnBuLXJlcG8tcHVibGljLmdwZwplY2hvICJkZWIgW2FyY2g9YW1kNjQgc2lnbmVkLWJ5PS9ldGMvYXB0L2tleXJpbmdzL29wZW52cG4tcmVwby1wdWJsaWMuZ3BnXSBodHRwczovL2J1aWxkLm9wZW52cG4ubmV0L2RlYmlhbi9vcGVudnBuL3N0YWJsZSBqYW1teSBtYWluIiA+IC9ldGMvYXB0L3NvdXJjZXMubGlzdC5kL29wZW52cG4tYXB0cmVwby5saXN0CmFwdCB1cGRhdGUKYXB0IGluc3RhbGwgb3BlbnZwbiBhd3NjbGkgZXhwZWN0IC15Cm1rZGlyIC9ldGMvZWFzeS1yc2EKd2dldCBodHRwczovL2dpdGh1Yi5jb20vT3BlblZQTi9lYXN5LXJzYS9yZWxlYXNlcy9kb3dubG9hZC92My4wLjYvRWFzeVJTQS11bml4LXYzLjAuNi50Z3oKdGFyIHhmIEVhc3lSU0EtdW5peC12My4wLjYudGd6IC0tc3RyaXAtY29tcG9uZW50cz0xIC1DIC9ldGMvZWFzeS1yc2EgJiYgcm0gRWFzeVJTQS11bml4LXYzLjAuNi50Z3oKY2F0IDw8RU9GID4vZXRjL2Vhc3ktcnNhL3ZhcnMKc2V0X3ZhciBFQVNZUlNBX1JFUV9DT1VOVFJZICAgICAiJENJVFkiCnNldF92YXIgRUFTWVJTQV9SRVFfUFJPVklOQ0UgICAgIiRDSVRZIgpzZXRfdmFyIEVBU1lSU0FfUkVRX0NJVFkgICAgICAgICIkQ0lUWSIKc2V0X3ZhciBFQVNZUlNBX1JFUV9PUkcgICAgICAgICAiJE9SRyIKc2V0X3ZhciBFQVNZUlNBX1JFUV9FTUFJTCAgICAgICAiJEVNQUlMIgpzZXRfdmFyIEVBU1lSU0FfUkVRX09VICAgICAgICAgICJSRCIKc2V0X3ZhciBFQVNZUlNBX0tFWV9TSVpFICAgICAgICA0MDk2CkVPRgpjZCAvcm9vdAovZXRjL2Vhc3ktcnNhL2Vhc3lyc2EgaW5pdC1wa2kKd2FpdApleHBlY3QgPDxFT0YKc3Bhd24gL2V0Yy9lYXN5LXJzYS9lYXN5cnNhIGJ1aWxkLWNhIG5vcGFzcwpleHBlY3QgLWV4YWN0ICJcckVudGVyIFBFTSBwYXNzIHBocmFzZToiCnNlbmQgLS0gIiRDT01QQU5ZXHIiCmV4cGVjdCAtZXhhY3QgIlxyVmVyaWZ5aW5nIC0gRW50ZXIgUEVNIHBhc3MgcGhyYXNlOiIKc2VuZCAtLSAiJENPTVBBTllcciIKZXhwZWN0IC1leGFjdCAiXHJDb21tb24gTmFtZSAoZWc6IHlvdXIgdXNlciwgaG9zdCwgb3Igc2VydmVyIG5hbWUpIFxbRWFzeS1SU0EgQ0FcXToiCnNlbmQgLS0gIiRDT01QQU5ZXHIiCmV4cGVjdCBlb2YKRU9GCndhaXQKZWNobyB7LH0gfCAvZXRjL2Vhc3ktcnNhL2Vhc3lyc2EgZ2VuLXJlcSAiJENPTVBBTlkiLXZwbiBub3Bhc3MKd2FpdApTSUdOPSIvZXRjL2Vhc3ktcnNhL2Vhc3lyc2Egc2lnbi1yZXEgc2VydmVyICIkQ09NUEFOWSItdnBuIG5vcGFzcyIKZXhwZWN0IDw8RU9GCnNwYXduICRTSUdOCmV4cGVjdCAtZXhhY3QgIlxyQ29uZmlybSByZXF1ZXN0IGRldGFpbHM6ICIKc2VuZCAtLSAieWVzXHIiCmV4cGVjdCAtZXhhY3QgIlxyRW50ZXIgcGFzcyBwaHJhc2UgZm9yIC9yb290L3BraS9wcml2YXRlL2NhLmtleToiCnNlbmQgLS0gIiRDT01QQU5ZXHIiCmV4cGVjdCBlb2YKRU9GCndhaXQKY3AgL3Jvb3Qve3BraS9pc3N1ZWQvIiRDT01QQU5ZIi12cG4uY3J0LHBraS9wcml2YXRlLyIkQ09NUEFOWSItdnBuLmtleSxwa2kvY2EuY3J0fSAvZXRjL29wZW52cG4vCi9ldGMvZWFzeS1yc2EvZWFzeXJzYSBnZW4tZGgKd2FpdApleHBlY3QgPDxFT0YKc3Bhd24gL2V0Yy9lYXN5LXJzYS9lYXN5cnNhIGdlbi1jcmwKZXhwZWN0IC1leGFjdCAiXHJFbnRlciBwYXNzIHBocmFzZSBmb3IgL3Jvb3QvcGtpL3ByaXZhdGUvY2Eua2V5OiIKc2VuZCAtLSAiJENPTVBBTllcciIKZXhwZWN0IGVvZgpFT0YKd2FpdApncm91cGFkZCBub2JvZHkKbWtkaXIgLXAgL2V0Yy9vcGVudnBuL2NsaWVudC1jb25maWdzL3tmaWxlcyxrZXlzfQpvcGVudnBuIC0tZ2Vua2V5IHNlY3JldCAiL3Jvb3QvdGEua2V5IgpjcCAvcm9vdC90YS5rZXkgL2V0Yy9vcGVudnBuCmNwIC9yb290L3BraS97Y3JsLnBlbSxkaC5wZW19IC9ldGMvb3BlbnZwbi8KY3AgL3Jvb3Qve3RhLmtleSxwa2kvY2EuY3J0fSAvZXRjL29wZW52cG4vY2xpZW50LWNvbmZpZ3Mva2V5cy8KY2F0IDw8RU9GID4vZXRjL29wZW52cG4vIiRDT01QQU5ZIi12cG4uY29uZgpwb3J0IDExOTQKcHJvdG8gdWRwCmRldiB0dW4KY2EgY2EuY3J0CmNlcnQgJENPTVBBTlktdnBuLmNydAprZXkgJENPTVBBTlktdnBuLmtleQpkaCBkaC5wZW0Kc2VydmVyIDEwLjguMC4wIDI1NS4yNTUuMjU1LjAKaWZjb25maWctcG9vbC1wZXJzaXN0IC92YXIvbG9nL29wZW52cG4vaXBwLnR4dApwdXNoICJyb3V0ZSAkVlBDIDI1NS4yNTUuMjU1LjAiCnB1c2ggImRoY3Atb3B0aW9uIEROUyAxLjEuMS4xIgpwdXNoICJkaGNwLW9wdGlvbiBETlMgOC44LjguOCIKa2VlcGFsaXZlIDEwIDEyMAp0bHMtYXV0aCB0YS5rZXkgMApjaXBoZXIgQUVTLTI1Ni1DQkMKdXNlciBub2JvZHkKZ3JvdXAgbm9ib2R5CnBlcnNpc3Qta2V5CnBlcnNpc3QtdHVuCnN0YXR1cyAvdmFyL2xvZy9vcGVudnBuL29wZW52cG4tc3RhdHVzLmxvZwpsb2cgL3Zhci9sb2cvb3BlbnZwbi9vcGVudnBuLmxvZwpjcmwtdmVyaWZ5IC9ldGMvb3BlbnZwbi9jcmwucGVtCmtleS1kaXJlY3Rpb24gMAphdXRoIFNIQTI1NgpzbmRidWYgMzkzMjE2CnJjdmJ1ZiAzOTMyMTYKcHVzaCAic25kYnVmIDM5MzIxNiIKcHVzaCAicmN2YnVmIDM5MzIxNiIKdHhxdWV1ZWxlbiAxMDAwMAp2ZXJiIDMKRU9GClBVQklQPSIkKGN1cmwgaWZjb25maWcubWUpIgpjYXQgPDxFT0YgPi9ldGMvb3BlbnZwbi9jbGllbnQtY29uZmlncy9iYXNlLmNvbmYKY2xpZW50CmRldiB0dW4KcHJvdG8gdWRwCnJlbW90ZSAkUFVCSVAgMTE5NApyb3V0ZSAkVlBDIDI1NS4yNTUuMC4wCnJlc29sdi1yZXRyeSBpbmZpbml0ZQpub2JpbmQKdXNlciBub2JvZHkKZ3JvdXAgbm9ncm91cApwZXJzaXN0LWtleQpwZXJzaXN0LXR1bgpyZW1vdGUtY2VydC10bHMgc2VydmVyCmNpcGhlciBBRVMtMjU2LUNCQwphdXRoIFNIQTI1NgprZXktZGlyZWN0aW9uIDEKbXNzZml4IDAKdmVyYiAzCkVPRgpjYXQgPDxFT0YgPi9yb290L2NyZWF0ZV92cG5fdXNlcgojIS9iaW4vYmFzaApWUE5VU0VSPVwkezEsLH0KVVNFUk5BTUU9IlwkKGVjaG8gIlwkVlBOVVNFUiIgfCBzZWQgJ3MvLmNvbS8vZzsgcy9ALy0vZycpIgpleHBvcnQgRUFTWVJTQV9SRVFfQ049XCRVU0VSTkFNRQpPVVRQVVRfRElSPS9ldGMvb3BlbnZwbi9jbGllbnQtY29uZmlncy9maWxlcwpLRVlfRElSPS9ldGMvb3BlbnZwbi9jbGllbnQtY29uZmlncy9rZXlzCkJBU0VfQ09ORklHPS9ldGMvb3BlbnZwbi9jbGllbnQtY29uZmlncy9iYXNlLmNvbmYKT1BFTlZQTl9ESVI9L2V0Yy9vcGVudnBuCkVBU1lSU0FfRElSPS9yb290CmlmIFsgIlwkVlBOVVNFUiIgPSAnJyBdOyB0aGVuCmV4aXQgMQplbHNlCmNkIFwkRUFTWVJTQV9ESVIKL2V0Yy9lYXN5LXJzYS9lYXN5cnNhIC0tYmF0Y2ggZ2VuLXJlcSBcJFVTRVJOQU1FIG5vcGFzcwovZXRjL2Vhc3ktcnNhL2Vhc3lyc2EgLS1iYXRjaCBzaWduLXJlcSBjbGllbnQgXCRVU0VSTkFNRQpjcCBcJEVBU1lSU0FfRElSL3BraS9wcml2YXRlL1wkVVNFUk5BTUUua2V5IC9ldGMvb3BlbnZwbi9jbGllbnQtY29uZmlncy9rZXlzLwpjcCBcJEVBU1lSU0FfRElSL3BraS9pc3N1ZWQvXCRVU0VSTkFNRS5jcnQgL2V0Yy9vcGVudnBuL2NsaWVudC1jb25maWdzL2tleXMvCmNkIFwkT1BFTlZQTl9ESVIvY2xpZW50LWNvbmZpZ3MvCmNhdCBcJHtCQVNFX0NPTkZJR30gPChlY2hvIC1lICc8Y2E+JykgXCR7S0VZX0RJUn0vY2EuY3J0IDwoZWNobyAtZSAnPC9jYT5cbjxjZXJ0PicpIFwke0tFWV9ESVJ9L1wke1VTRVJOQU1FfS5jcnQgPChlY2hvIC1lICc8L2NlcnQ+XG48a2V5PicpIFwke0tFWV9ESVJ9L1wke1VTRVJOQU1FfS5rZXkgPChlY2hvIC1lICc8L2tleT5cbjx0bHMtYXV0aD4nKSBcJHtLRVlfRElSfS90YS5rZXkgPChlY2hvIC1lICc8L3Rscy1hdXRoPicpID4gXCR7T1VUUFVUX0RJUn0vXCRVU0VSTkFNRS5vdnBuClNVQkpFQ1Q9Ik5ldyBPcGVuVlBOIFwkVVNFUk5BTUUgVXNlciIKQk9EWT0iRG93bmxvYWQgdGhpcyBjb25maWd1cmF0aW9uIGFuZCBydW4gaXQgd2l0aGluIHlvdXIgT3BlblZQTiBjbGllbnQuIgpGSUxFPSJcJFVTRVJOQU1FLm92cG4iClJFQUQ9IlwkKHByaW50ZiAnJXEnICJcJChjYXQgXCRPVVRQVVRfRElSL1wkVVNFUk5BTUUub3ZwbikiKSIKZWNobyAneyJEYXRhIjogIkZyb206ICRFTUFJTFxuVG86ICdcJFZQTlVTRVInXG5TdWJqZWN0OiAnXCRTVUJKRUNUJ1xuTUlNRS1WZXJzaW9uOiAxLjBcbkNvbnRlbnQtdHlwZTogTXVsdGlwYXJ0L01peGVkOyBib3VuZGFyeT1cIk5leHRQYXJ0XCJcblxuLS1OZXh0UGFydFxuQ29udGVudC1UeXBlOiB0ZXh0L3BsYWluXG5cbidcJEJPRFknXG5cbi0tTmV4dFBhcnRcbkNvbnRlbnQtVHlwZTogYXBwbGljYXRpb24vb3ZwbjtcbkNvbnRlbnQtRGlzcG9zaXRpb246IGF0dGFjaG1lbnQ7IGZpbGVuYW1lPVwiJ1wkRklMRSdcIlxuXG4nXCR7UkVBRDoyOi0xfSdcbi0tTmV4dFBhcnQtLSJ9JyA+IG1lc3NhZ2UuanNvbgphd3Mgc2VzIHNlbmQtcmF3LWVtYWlsIC0tcmVnaW9uICRDSVRZIC0tcmF3LW1lc3NhZ2UgZmlsZTovL21lc3NhZ2UuanNvbgpybSBtZXNzYWdlLmpzb24KY2QgXCRFQVNZUlNBX0RJUgoJZXhwZWN0IDw8LUVPRgogICAgc3Bhd24gL2V0Yy9lYXN5LXJzYS9lYXN5cnNhIGdlbi1jcmwKICAgIGV4cGVjdCAtZXhhY3QgIlxyRW50ZXIgcGFzcyBwaHJhc2UgZm9yIC9yb290L3BraS9wcml2YXRlL2NhLmtleToiCiAgICBzZW5kIC0tICIkQ09NUEFOWVxyIgogICAgZXhwZWN0IGVvZgoJRU9GCmNwIFwkRUFTWVJTQV9ESVIvcGtpL2NybC5wZW0gXCRPUEVOVlBOX0RJUi9jcmwucGVtCnJtIFwke09VVFBVVF9ESVJ9L1wkVVNFUk5BTUUub3ZwbgpzeXN0ZW1jdGwgcmVzdGFydCBvcGVudnBuQCRDT01QQU5ZLXZwbgpmaQpFT0YKY2htb2QgK3ggL3Jvb3QvY3JlYXRlX3Zwbl91c2VyCmNhdCA8PEVPRiA+L3Jvb3QvcmV2b2tlX3Zwbl91c2VyCiMhL2Jpbi9iYXNoClZQTlVTRVI9XCR7MSwsfQpVU0VSTkFNRT0iXCQoZWNobyAiXCRWUE5VU0VSIiB8IHNlZCAncy8uY29tLy9nOyBzL0AvLS9nJykiCmV4cG9ydCBFQVNZUlNBX1JFUV9DTj1cJFVTRVJOQU1FCktFWV9ESVI9L2V0Yy9vcGVudnBuL2NsaWVudC1jb25maWdzL2tleXMKT1VUUFVUX0RJUj0vZXRjL29wZW52cG4vY2xpZW50LWNvbmZpZ3MvZmlsZXMKQkFTRV9DT05GSUc9L2V0Yy9vcGVudnBuL2NsaWVudC1jb25maWdzL2Jhc2UuY29uZgpPUEVOVlBOX0RJUj0vZXRjL29wZW52cG4KRUFTWVJTQV9ESVI9L3Jvb3QKaWYgWyAiXCRVU0VSTkFNRSIgPSAnJyBdOyB0aGVuCmV4aXQgMQplbHNlCmNkIFwkRUFTWVJTQV9ESVIKL2V0Yy9lYXN5LXJzYS9lYXN5cnNhIC0tYmF0Y2ggcmV2b2tlIFwkVVNFUk5BTUUKCWV4cGVjdCA8PC1FT0YKICAgIHNwYXduIC9ldGMvZWFzeS1yc2EvZWFzeXJzYSBnZW4tY3JsCiAgICBleHBlY3QgLWV4YWN0ICJcckVudGVyIHBhc3MgcGhyYXNlIGZvciAvcm9vdC9wa2kvcHJpdmF0ZS9jYS5rZXk6IgogICAgc2VuZCAtLSAiJENPTVBBTllcciIKICAgIGV4cGVjdCBlb2YKCUVPRgpjcCBcJEVBU1lSU0FfRElSL3BraS9jcmwucGVtIFwkT1BFTlZQTl9ESVIvCnN5c3RlbWN0bCByZXN0YXJ0IG9wZW52cG5AJENPTVBBTlktdnBuCmZpCkVPRgpjaG1vZCAreCAvcm9vdC9yZXZva2VfdnBuX3VzZXIKdG91Y2ggL3Jvb3Qve2xpc3Rfb2ZfbmV3X3VzZXJzLnR4dCxsaXN0X29mX3Zwbl91c2Vycy50eHR9CmNhdCA8PEVPRiA+L3Jvb3QvY3JlYXRlX3Zwbl91c2VyX2xpc3QKZnVuY3Rpb24gbGluZV9leGlzdHNfaW5fZmlsZSB7CiAgICBsb2NhbCBsaW5lPVwkMQogICAgbG9jYWwgZmlsZT1cJDIKICAgIGdyZXAgLUZ4cSAiXCRsaW5lIiAiXCRmaWxlIgp9CmZpbGUxPSIvcm9vdC9saXN0X29mX25ld191c2Vycy50eHQiCmZpbGUyPSIvcm9vdC9saXN0X29mX3Zwbl91c2Vycy50eHQiCmVjaG8gPj4gIlwkZmlsZTEiCmVjaG8gPj4gIlwkZmlsZTIiCndoaWxlIElGUz0gcmVhZCAtciBsaW5lCmRvCiAgICBpZiAhIGxpbmVfZXhpc3RzX2luX2ZpbGUgIlwkbGluZSIgIlwkZmlsZTIiCiAgICB0aGVuCiAgICBDUkU9Ii9yb290L2NyZWF0ZV92cG5fdXNlciBcJGxpbmUiCglleHBlY3QgPDwtRU9GCiAgICBzcGF3biBcJENSRQogICAgZXhwZWN0IC1leGFjdCAiXHJFbnRlciBwYXNzIHBocmFzZSBmb3IgL3Jvb3QvcGtpL3ByaXZhdGUvY2Eua2V5OiIKICAgIHNlbmQgLS0gIiRDT01QQU5ZXHIiCiAgICBleHBlY3QgLWV4YWN0ICJcckVudGVyIHBhc3MgcGhyYXNlIGZvciAvcm9vdC9wa2kvcHJpdmF0ZS9jYS5rZXk6IgogICAgc2VuZCAtLSAiJENPTVBBTllcciIKICAgIGV4cGVjdCBlb2YKCUVPRgogICAgd2FpdAogICAgZmkKZG9uZSA8ICJcJGZpbGUxIgoKd2hpbGUgSUZTPSByZWFkIC1yIGxpbmUKZG8KICAgIGlmICEgbGluZV9leGlzdHNfaW5fZmlsZSAiXCRsaW5lIiAiXCRmaWxlMSIKICAgIHRoZW4KICAgIFJFVj0iL3Jvb3QvcmV2b2tlX3Zwbl91c2VyIFwkbGluZSIKCWV4cGVjdCA8PC1FT0YKICAgIHNwYXduIFwkUkVWCiAgICBleHBlY3QgLWV4YWN0ICJcckVudGVyIHBhc3MgcGhyYXNlIGZvciAvcm9vdC9wa2kvcHJpdmF0ZS9jYS5rZXk6IgogICAgc2VuZCAtLSAiJENPTVBBTllcciIKICAgIGV4cGVjdCAtZXhhY3QgIlxyRW50ZXIgcGFzcyBwaHJhc2UgZm9yIC9yb290L3BraS9wcml2YXRlL2NhLmtleToiCiAgICBzZW5kIC0tICIkQ09NUEFOWVxyIgogICAgZXhwZWN0IGVvZgoJRU9GCiAgICB3YWl0CiAgICBmaQpkb25lIDwgIlwkZmlsZTIiCkVPRgpjaG1vZCAreCAvcm9vdC9jcmVhdGVfdnBuX3VzZXJfbGlzdApjYXQgPDwtRU9GID4+L2V0Yy9zeXNjdGwuY29uZgpuZXQuaXB2NC5pcF9mb3J3YXJkPTEKRU9GCnN5c2N0bCAtdyBuZXQuaXB2NC5pcF9mb3J3YXJkPTEKY2F0IDw8LUVPRiA+L3Jvb3QvcmVwYWlyLW5ldAojIS9iaW4vYmFzaAppcHRhYmxlcyAtSSBJTlBVVCAtcCB1ZHAgLS1kcG9ydCAxMTk0IC1qIEFDQ0VQVAppcHRhYmxlcyAtdCBuYXQgLUEgUE9TVFJPVVRJTkcgLXMgMTAuOC4wLjAvMTYgLW8gIiRORVRBREFQVCIgLWogTUFTUVVFUkFERQppcHRhYmxlcyAtdCBuYXQgLUkgUE9TVFJPVVRJTkcgLXMgMTAuOC4wLjAvMTYgLWQgMTAuMC4wLjAvMTYgLW8gIiRORVRBREFQVCIgLWogTUFTUVVFUkFERQppcHRhYmxlcy1zYXZlCkVPRgpjaG1vZCAreCAvcm9vdC9yZXBhaXItbmV0CmJhc2ggL3Jvb3QvcmVwYWlyLW5ldApjYXQgPDwtRU9GID5+L3ZwbmNyb24KMCAwICogKiBzYXQgYXB0IC15IHVwZGF0ZSAtLXNlY3VyaXR5CjEgMCAqICogKiAvcm9vdC9yZXBhaXItbmV0CkVPRgpjcm9udGFiIH4vdnBuY3JvbgpzeXN0ZW1jdGwgc3RhcnQgb3BlbnZwbkAiJENPTVBBTlkiLXZwbgpzeXN0ZW1jdGwgZW5hYmxlIG9wZW52cG5AIiRDT01QQU5ZIi12cG4=" | base64 --decode >> /root/start_OpenVPN.sh
+          chmod -x /root/start_OpenVPN.sh
+          bash /root/start_OpenVPN.sh
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}.Ec2.${InstanceType}'
+        - Key: Description
+          Value: !Sub 'OpenVPN EC2 instance for ${ProjectName}'
+        - Key: Project
+          Value: !Sub '${ProjectName}'
+  # Create Security grope for allowing the ingres on port 1194 and 22.
+  OpenVPNSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcID
+      GroupName: !Sub '${ProjectName}.SG'
+      GroupDescription: Security group for OpenVPN
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: !Ref SSHSourceCidr
+      - IpProtocol: udp
+        FromPort: 1194
+        ToPort: 1194
+        CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}.VPN-SG'
+        - Key: Project
+          Value: !Sub '${ProjectName}'
+  # Create IAM profile for OpenVPN instance.
+  OpenVPNIamProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: '/'
+      Roles: [!Ref OpenVPNRole]
+  # Create Role for OpenVPN instance.
+  OpenVPNRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}.AllowDescribeRole'
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  # Create Policy for allowing Describe.
+  OpenVPNPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}.AllowDescribePolicy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ec2:DescribeTags'
+              - 'ec2:DescribeRegions'
+              - 'ec2:DescribeInstances'
+            Resource: '*'
+      Roles:
+        - !Ref OpenVPNRole
+  VPNssmPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}.AllowSSMPolicy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ssm:ListDocuments'
+              - 'ssm:DescribeDocument*'
+              - 'ssm:GetDocument'
+              - 'ssm:DescribeInstance*'
+            Resource: '*'
+      Roles:
+        - !Ref OpenVPNRole
+  VPNs3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}.AllowS3toEc2Policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:GetObject'
+            Resource:
+              - !Sub 'arn:aws:s3:::${UsersBucket}'
+              - !Sub 'arn:aws:s3:::${UsersBucket}/*'
+      Roles:
+        - !Ref OpenVPNRole
+  VPNsesPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}.AllowSESPolicy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ses:SendEmail'
+              - 'ses:SendRawEmail'
+            Resource: '*'
+      Roles:
+        - !Ref OpenVPNRole
+  # Amazon Simple Email Service
+  EmailVerification:
+    Type: 'AWS::SES::EmailIdentity'
+    Properties:
+        EmailIdentity: !Ref Email
+  SESReceiptRuleSet:
+    Type: 'AWS::SES::ReceiptRuleSet'
+    Properties:
+      RuleSetName: 'DefaultRuleSet'
+  # Log
+  LogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: vpc-flow-logs.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: flowlogs-policy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'logs:CreateLogStream'
+            - 'logs:PutLogEvents'
+            - 'logs:DescribeLogGroups'
+            - 'logs:DescribeLogStreams'
+            Resource: !GetAtt LogGroup.Arn
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 90
+  FlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      DeliverLogsPermissionArn: !GetAtt LogRole.Arn
+      LogGroupName: !Ref LogGroup
+      ResourceId: !Ref VPNENI
+      ResourceType: NetworkInterface
+      TrafficType: ALL
+### Parameters
+  ProjectParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${ProjectName}.project'
+      Type: String
+      Value: !Ref ProjectName
+      Description: SSM Parameter for Project name
+  EIPParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${ProjectName}.Ec2-Ip'
+      Type: String
+      Value: !GetAtt OpenVPN.PublicIp
+      Description: SSM Parameter for OpenVPN EIP
+    DependsOn: OpenVPN
+  Ec2IpParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${ProjectName}.Ec2-Id'
+      Type: String
+      Value: !Ref OpenVPN
+      Description: SSM Parameter for OpenVPN ec2 ID
+    DependsOn: OpenVPN
+  S3IdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${ProjectName}.S3-Id'
+      Type: String
+      Value: !Ref UsersBucket
+      Description: SSM Parameter for Users S3 bucket name
+    DependsOn: UsersBucket
+  EmailParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${ProjectName}.ses-email'
+      Type: String
+      Value: !Ref Email
+      Description: SSM Parameter for SES email sending
+    DependsOn: UsersBucket
+#Names and values for the resources.
+Outputs:
+  OpenVPNIP:
+    Description: OpenVPN Public IP
+    Value: !GetAtt OpenVPN.PublicIp
+  OpenVPNUser:
+    Description: Connect to the instance and run as sudo user in the root directory to create user.
+    Value: ./create_vpn_user <firstname-lastname>

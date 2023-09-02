@@ -1,0 +1,94 @@
+name: 5 - Certificate renewal - automation
+
+env:
+  AWS_REGION: 'eu-west-1'
+  PROJECT: 'vnp'
+  ENV: 'dev'
+
+on:
+  schedule:
+    - cron: '0 23 * * SUN'  # At 23:00 on Sunday
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+          persist-credentials: false
+          fetch-depth: 0
+     
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_DEV }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_DEV }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Certificate renewal automation
+      id: renew
+      run: |
+        ID="Key=InstanceIds,Values=$(aws ssm get-parameter --name ${{ env.PROJECT }}-${{ env.ENV }}-vpn-ec2-id --query "Parameter.Value" --output text --region ${{ env.AWS_REGION }})"
+        S3="$(aws ssm get-parameter --name ${{ env.PROJECT }}-${{ env.ENV }}-vpn-users --query "Parameter.Value" --output text --region ${{ env.AWS_REGION }})"
+        
+        # Select users for certificate renewal
+        touch ./user/user-renew
+        ./scripts/user_renew.sh ./user/cert-list ./user/user-renew
+
+        # If it is necessary to regenerate the certificate continue with the script
+        if grep -q '\w' ./user/user-renew; then
+         
+          # Push new list to S3
+          aws s3 sync ./user/ s3://$S3/
+          
+          # Get new cert list from S3 bucket
+          aws ssm send-command \
+          --comment "Get new certificate list" \
+          --targets $ID \
+          --document-name "AWS-RunShellScript" \
+          --parameters 'commands=["aws s3api get-object --bucket '"$S3"' --key user-renew /root/user/user-renew"]' \
+          --output table
+          
+          # Update certs fom the new list
+          aws ssm send-command \
+          --comment "Update certificates" \
+          --targets $ID \
+          --document-name "AWS-RunShellScript" \
+          --parameters '{"commands":["sleep 5s && cd /root/ && sudo bash /root/script/auto_cert_renew /root/user/user-renew > /root/log/cert.log && rm /root/user/user-renew"]}' \
+          --output table
+          
+          # Replace the expiring certificate with an extended validity period.
+          ./scripts/user_cert_update.sh ./user/user-renew ./user/cert-list
+          rm ./user/user-renew
+          
+          # Remove list from S3
+          sleep 10s && aws s3 rm s3://$S3/user-renew
+
+          # Add a trigger for other jobs
+          echo "trigger=true" >> $GITHUB_OUTPUT
+        
+        else
+          
+          echo "Everything is up to date"
+        
+        fi
+      
+    - name: Commit changes
+      run: |
+        if [[ "${{ steps.renew.outputs.trigger }}" == 'true' ]]; then
+          git config --local user.email "senad.dizdarevic@example.com"
+          git config --local user.name "senad-d"
+          git commit -a -m "Add changes"
+        else
+          echo "Git is up to date"
+        fi
+     
+    - name: Push changes
+      if: steps.renew.outcome == 'success'
+      uses: ad-m/github-push-action@master
+      with:
+        github_token: ${{ secrets.GIT_TOKEN }}
+        branch: ${{ github.ref }}

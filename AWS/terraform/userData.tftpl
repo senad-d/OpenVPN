@@ -1,0 +1,356 @@
+#!/bin/bash -xe
+
+EMAIL="${Email}"
+ADMIN="${Admin}"
+ORG="${Organization}"
+COMPANY="${Company}"
+REGION="${Region}"
+VPC="${VpcCIDR}"
+CERT="${Cert}"
+NETADAPT="$(ip route | grep default | sed -e "s/^.*dev.//" -e "s/.proto.*//")"
+export DEBIAN_FRONTEND=noninteractive
+
+# Add OpenVPN to APT sources
+mkdir -p /etc/apt/keyrings && curl -fsSL https://swupdate.openvpn.net/repos/repo-public.gpg | gpg --dearmor > /etc/apt/keyrings/openvpn.gpg
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/openvpn.gpg] https://build.openvpn.net/debian/openvpn/stable jammy main" > /etc/apt/sources.list.d/openvpn.list
+
+# Install EasyRSA
+mkdir /etc/easy-rsa
+wget https://github.com/OpenVPN/easy-rsa/releases/download/v3.0.6/EasyRSA-unix-v3.0.6.tgz
+tar xf EasyRSA-unix-v3.0.6.tgz --strip-components=1 -C /etc/easy-rsa && rm EasyRSA-unix-v3.0.6.tgz
+
+# Update and Install software
+apt-get update
+apt-get install openvpn awscli expect -y
+
+# Configure VPN variables
+cat <<EOF >/etc/easy-rsa/vars
+set_var EASYRSA_REQ_CITY        "$${REGION::-1}"
+set_var EASYRSA_REQ_ORG         "$ORG"
+set_var EASYRSA_REQ_EMAIL       "$EMAIL"
+set_var EASYRSA_CERT_EXPIRE     "$CERT"
+set_var EASYRSA_REQ_OU          "RD"
+set_var EASYRSA_KEY_SIZE        4096
+EOF
+
+# Initialize PKI
+cd /root
+/etc/easy-rsa/easyrsa init-pki
+wait
+
+# Build CA
+expect <<EOF
+spawn /etc/easy-rsa/easyrsa build-ca nopass
+expect -exact "\rEnter PEM pass phrase:"
+send -- "$COMPANY\r"
+expect -exact "\rVerifying - Enter PEM pass phrase:"
+send -- "$COMPANY\r"
+expect -exact "\rCommon Name (eg: your user, host, or server name) \[Easy-RSA CA\]:"
+send -- "$COMPANY\r"
+expect eof
+EOF
+wait
+
+# Build Server Cert
+echo {,} | /etc/easy-rsa/easyrsa gen-req "$COMPANY"-vpn nopass
+wait
+
+# Sign Server Cert
+SIGN="/etc/easy-rsa/easyrsa sign-req server "$COMPANY"-vpn nopass"
+expect <<EOF
+spawn $SIGN
+expect -exact "\rConfirm request details: "
+send -- "yes\r"
+expect -exact "\rEnter pass phrase for /root/pki/private/ca.key:"
+send -- "$COMPANY\r"
+expect eof
+EOF
+wait
+
+# Build Client Cert
+cp /root/{pki/issued/"$COMPANY"-vpn.crt,pki/private/"$COMPANY"-vpn.key,pki/ca.crt} /etc/openvpn/
+/etc/easy-rsa/easyrsa gen-dh
+wait
+expect <<EOF
+spawn /etc/easy-rsa/easyrsa gen-crl
+expect -exact "\rEnter pass phrase for /root/pki/private/ca.key:"
+send -- "$COMPANY\r"
+expect eof
+EOF
+wait
+
+# Configure files
+groupadd nobody
+mkdir -p /etc/openvpn/client-configs/{files,keys}
+openvpn --genkey secret "/root/ta.key"
+cp /root/ta.key /etc/openvpn
+cp /root/pki/{crl.pem,dh.pem} /etc/openvpn/
+cp /root/{ta.key,pki/ca.crt} /etc/openvpn/client-configs/keys/
+
+# Create OpenVPN server configuration
+cat <<EOF >/etc/openvpn/"$COMPANY"-vpn.conf
+port 1194
+proto udp
+dev tun
+ca ca.crt
+cert $COMPANY-vpn.crt
+key $COMPANY-vpn.key
+dh dh.pem
+server 10.8.0.0 255.255.255.0
+ifconfig-pool-persist /var/log/openvpn/ipp.txt
+push "route $VPC 255.255.255.0"
+push "dhcp-option DNS 1.1.1.1"
+push "dhcp-option DNS 8.8.8.8"
+keepalive 10 120
+tls-auth ta.key 0
+cipher AES-256-CBC
+user nobody
+group nobody
+persist-key
+persist-tun
+status /var/log/openvpn/openvpn-status.log
+log /var/log/openvpn/openvpn.log
+crl-verify /etc/openvpn/crl.pem
+key-direction 0
+auth SHA256
+sndbuf 393216
+rcvbuf 393216
+push "sndbuf 393216"
+push "rcvbuf 393216"
+txqueuelen 10000
+verb 3
+EOF
+
+# Create OpenVPN client configuration
+PUBIP="$(curl ifconfig.me)"
+cat <<EOF >/etc/openvpn/client-configs/base.conf
+client
+dev tun
+proto udp
+remote $PUBIP 1194
+route $VPC 255.255.255.0
+resolv-retry infinite
+nobind
+user nobody
+group nogroup
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-256-CBC
+auth SHA256
+key-direction 1
+mssfix 0
+verb 3
+EOF
+
+# Create OpenVPN directory structure and files for user management
+mkdir -p /root/{script,user,log}
+touch /root/user/{list_of_new_users.txt,list_of_vpn_users.txt}
+
+# OpenVPN user creation script
+cat <<EOF >/root/script/create_vpn_user
+#!/bin/bash
+VPNUSER=\$${1,,}
+USERNAME="\$(echo "\$VPNUSER" | sed 's/.com//g; s/@/-/g')"
+export EASYRSA_REQ_CN=\$USERNAME
+OUTPUT_DIR=/etc/openvpn/client-configs/files
+KEY_DIR=/etc/openvpn/client-configs/keys
+BASE_CONFIG=/etc/openvpn/client-configs/base.conf
+OPENVPN_DIR=/etc/openvpn
+EASYRSA_DIR=/root
+if [ "\$VPNUSER" = '' ]; then
+exit 1
+else
+cd \$EASYRSA_DIR
+/etc/easy-rsa/easyrsa --batch gen-req \$USERNAME nopass
+/etc/easy-rsa/easyrsa --batch sign-req client \$USERNAME
+cp \$EASYRSA_DIR/pki/private/\$USERNAME.key /etc/openvpn/client-configs/keys/
+cp \$EASYRSA_DIR/pki/issued/\$USERNAME.crt /etc/openvpn/client-configs/keys/
+cd \$OPENVPN_DIR/client-configs/
+cat \$BASE_CONFIG <(echo -e '<ca>') \$KEY_DIR/ca.crt <(echo -e '</ca>\n<cert>') \$KEY_DIR/\$USERNAME.crt <(echo -e '</cert>\n<key>') \$KEY_DIR/\$USERNAME.key <(echo -e '</key>\n<tls-auth>') \$KEY_DIR/ta.key <(echo -e '</tls-auth>') > \$OUTPUT_DIR/\$USERNAME.ovpn
+SUBJECT="Your New OpenVPN user file for \$USERNAME"
+BODY="We are pleased to inform you that your OpenVPN user account has been successfully created.\n\nYour user account has been set up and configured to provide you with secure access to our network resources.\n\nAttached to this email is your personalized OpenVPN configuration file.\nPlease save this file to a secure location on your computer.\n\nHow to Install OpenVPN Client\n1. Go to the website for OpenVPN clients at openvpn.net/client/ and download the appropriate installer for your operating system.\n2. Run the installer and follow the on-screen instructions to install the OpenVPN client.\n3. Once the installation is complete, launch the OpenVPN client.\n4. Click the "Import" button and select the configuration file for the VPN server.\n5. Click the "Connect" button to connect to the VPN server.\n\nThat's it! You should now be connected to the VPN server using the OpenVPN client.\n\nValcon Nebula Project"
+FILE="\$USERNAME.ovpn"
+READ="\$(printf '%q' "\$(cat \$OUTPUT_DIR/\$USERNAME.ovpn)")"
+echo '{"Data": "From: $EMAIL\nTo: '\$VPNUSER'\nSubject: '\$SUBJECT'\nMIME-Version: 1.0\nContent-type: Multipart/Mixed; boundary=\"NextPart\"\n\n--NextPart\nContent-Type: text/plain\n\n'\$BODY'\n\n--NextPart\nContent-Type: application/ovpn;\nContent-Disposition: attachment; filename=\"'\$FILE'\"\n\n'\$${READ:2:-1}'\n--NextPart--"}' > message.json
+aws ses send-raw-email --region $${REGION::-1} --raw-message file://message.json
+rm message.json
+cd \$EASYRSA_DIR
+	expect <<-EOF
+    spawn /etc/easy-rsa/easyrsa gen-crl
+    expect -exact "\rEnter pass phrase for /root/pki/private/ca.key:"
+    send -- "$COMPANY\r"
+    expect eof
+	EOF
+cp \$EASYRSA_DIR/pki/crl.pem \$OPENVPN_DIR/crl.pem
+rm \$OUTPUT_DIR/\$USERNAME.ovpn
+systemctl restart openvpn@$COMPANY-vpn
+fi
+EOF
+chmod +x /root/script/create_vpn_user
+
+# OpenVPN user revocation script
+cat <<EOF >/root/script/revoke_vpn_user
+#!/bin/bash
+VPNUSER=\$${1,,}
+USERNAME="\$(echo "\$VPNUSER" | sed 's/.com//g; s/@/-/g')"
+export EASYRSA_REQ_CN=\$USERNAME
+KEY_DIR=/etc/openvpn/client-configs/keys
+OUTPUT_DIR=/etc/openvpn/client-configs/files
+BASE_CONFIG=/etc/openvpn/client-configs/base.conf
+OPENVPN_DIR=/etc/openvpn
+EASYRSA_DIR=/root
+if [ "\$USERNAME" = '' ]; then
+exit 1
+else
+cd \$EASYRSA_DIR
+/etc/easy-rsa/easyrsa --batch revoke \$USERNAME
+	expect <<-EOF
+    spawn /etc/easy-rsa/easyrsa gen-crl
+    expect -exact "\rEnter pass phrase for /root/pki/private/ca.key:"
+    send -- "$COMPANY\r"
+    expect eof
+	EOF
+SUBJECT="OpenVPN User Account Termination Confirmation"
+BODY="We regret to inform you that your \$USERNAME account has been terminated.\n\nPlease note that you will no longer have access to any services or resources associated with your OpenVPN configuration file.\n\nValcon Nebula Project"
+echo '{"Data": "From: $EMAIL\nTo: '\$VPNUSER'\nSubject: '\$SUBJECT'\nMIME-Version: 1.0\nContent-type: Multipart/Mixed; boundary=\"NextPart\"\n\n--NextPart\nContent-Type: text/plain\n\n'\$BODY'\n\n--NextPart--"}' > message.json
+aws ses send-raw-email --region $${REGION::-1} --raw-message file://message.json
+rm message.json
+cp \$EASYRSA_DIR/pki/crl.pem \$OPENVPN_DIR/
+systemctl restart openvpn@$COMPANY-vpn
+fi
+EOF
+chmod +x /root/script/revoke_vpn_user
+
+# OpenVPN user list creation scrip
+cat <<EOF >/root/script/create_vpn_user_list
+function line_exists_in_file {
+    local line=\$1
+    local file=\$2
+    grep -Fxq "\$line" "\$file"
+}
+file1="/root/user/list_of_new_users.txt"
+file2="/root/user/list_of_vpn_users.txt"
+echo >> "\$file1"
+echo >> "\$file2"
+while IFS= read -r line
+do
+    if ! line_exists_in_file "\$line" "\$file2"
+    then
+    CRE="/root/script/create_vpn_user \$line"
+	expect <<-EOF
+    spawn \$CRE
+    expect -exact "\rEnter pass phrase for /root/pki/private/ca.key:"
+    send -- "$COMPANY\r"
+    expect -exact "\rEnter pass phrase for /root/pki/private/ca.key:"
+    send -- "$COMPANY\r"
+    expect eof
+	EOF
+    wait
+    fi
+done < "\$file1"
+while IFS= read -r line
+do
+    if ! line_exists_in_file "\$line" "\$file1"
+    then
+    REV="/root/script/revoke_vpn_user \$line"
+	expect <<-EOF
+    spawn \$REV
+    expect -exact "\rEnter pass phrase for /root/pki/private/ca.key:"
+    send -- "$COMPANY\r"
+    expect -exact "\rEnter pass phrase for /root/pki/private/ca.key:"
+    send -- "$COMPANY\r"
+    expect eof
+	EOF
+    wait
+    fi
+done < "\$file2"
+EOF
+chmod +x /root/script/create_vpn_user_list
+
+# Auto certificate renewal script
+cat <<EOF >/root/script/auto_cert_renew
+#!/bin/bash
+userlist="\$1"
+touch /root/user/renewal_list
+while IFS= read -r username; do
+    if [ -n "\$username" ]; then
+        /root/script/server_cert_renew "\$username"
+        wait
+        echo "Renew user: \$username"
+        echo "\$username" >> /root/user/renewal_list
+    fi
+done < "\$userlist"
+
+if [ ! -s "/root/user/renewal_list" ]; then
+    echo "Input file renewal_list is empty."
+else
+    LIST="\$(cat /root/user/renewal_list | less | sed 's/$/\\\n/')"
+    SUBJECT="OpenVPN User Account Renewal Confirmation"
+    BODY="We hereby inform you that, as of today's date, certificates for VPN users from the list below have been renewed.\nIf there are users in this list whose certificates have been extended but are no longer part of the team, we kindly request that you remove them from the VPN user list.\n\nList of users whose certificates have been renewed:\n\$LIST\n\nValcon Nebula Project"
+    echo '{"Data": "From: $EMAIL\nTo: '$ADMIN'\nSubject: '\$SUBJECT'\nMIME-Version: 1.0\nContent-type: Multipart/Mixed; boundary=\"NextPart\"\n\n--NextPart\nContent-Type: text/plain\n\n'\$BODY'\n\n--NextPart--"}' > message.json
+    aws ses send-raw-email --region $${REGION::-1} --raw-message file://message.json
+    rm message.json 
+fi
+rm /root/user/renewal_list
+EOF
+chmod +x /root/script/auto_cert_renew
+
+# Client certificate renewal script
+cat <<EOF >/root/script/client_cert_renew
+#!/bin/bash
+VPNUSER=\$${1,,}
+USERNAME="\$(echo "\$VPNUSER" | sed 's/.com//g; s/@/-/g')"
+    expect <<-EOF
+    spawn /etc/easy-rsa/easyrsa renew \$USERNAME
+    expect -exact "\r  Continue with renew:"
+    send -- "yes\r"
+    expect eof
+    EOF
+systemctl restart openvpn@$COMPANY-vpn
+EOF
+chmod +x /root/script/client_cert_renew
+
+# OpenVPN certificate renewal script
+cat <<EOF >/root/script/server_cert_renew
+#!/bin/bash
+    expect <<-EOF
+    spawn /etc/easy-rsa/easyrsa renew $COMPANY-vpn
+    expect -exact "\r  Continue with renew:"
+    send -- "yes\r"
+    expect eof
+    EOF
+systemctl restart openvpn@$COMPANY-vpn
+EOF
+chmod +x /root/script/server_cert_renew
+
+# OpenVPN ip forwarding script
+cat <<-EOF >>/etc/sysctl.conf
+net.ipv4.ip_forward=1
+EOF
+sysctl -w net.ipv4.ip_forward=1
+
+# OpenVPN network adaptor script
+cat <<-EOF >/root/repair-net
+#!/bin/bash
+iptables -I INPUT -p udp --dport 1194 -j ACCEPT
+iptables -t nat -A POSTROUTING -s 10.8.0.0/16 -o "$NETADAPT" -j MASQUERADE
+iptables -t nat -I POSTROUTING -s 10.8.0.0/16 -d 10.0.0.0/16 -o "$NETADAPT" -j MASQUERADE
+iptables-save
+EOF
+chmod +x /root/repair-net
+bash /root/repair-net
+
+# OpenVPN cron script
+TIME="$(date -d "+$CERT days" +%d-%m)"
+cat <<EOF >/root/vpncron
+0 0 * * sat  apt-get -y update --security
+1 0 * * *    /root/repair-net
+0 0 $${TIME//\-/ } * /root/server_cert_renew
+EOF
+chmod +x /root/vpncron
+crontab ~/vpncron
+
+# Start OpenVPN
+systemctl start openvpn@"$COMPANY"-vpn
+systemctl enable openvpn@"$COMPANY"-vpn
